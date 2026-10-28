@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MD Brain</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    :root {
+      --bg-base: #0b0714;
+      --bg-panel: #120b20;
+      --bg-surface: #1b1030;
+      --bg-hover: #271644;
+      --border-color: #2b1a47;
+      --accent: #9d4edd;
+      --accent-bright: #c77dff;
+      --text-main: #e2d9f3;
+      --text-muted: #8d7ea8;
+      --tag-bg: #2d164d;
+      --sidebar-width: 280px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg-base);
+      color: var(--text-main);
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* Sidebar Layout */
+    #sidebar {
+      width: var(--sidebar-width);
+      min-width: 220px;
+      background: var(--bg-panel);
+      border-right: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      transition: margin-left 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      z-index: 10;
+    }
+    #sidebar.hidden {
+      margin-left: calc(-1 * var(--sidebar-width));
+    }
+
+    .brand {
+      padding: 14px 16px;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--accent-bright);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      letter-spacing: 0.8px;
+    }
+
+    .sidebar-actions {
+      display: flex;
+      gap: 6px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border-color);
+      background: rgba(0, 0, 0, 0.2);
+    }
+    .btn-action {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      border-radius: 4px;
+      padding: 4px 8px;
+      cursor: pointer;
+      font-size: 11px;
+      text-transform: uppercase;
+      font-weight: 600;
+      transition: all 0.15s;
+    }
+    .btn-action:hover {
+      background: var(--bg-hover);
+      color: var(--accent-bright);
+      border-color: var(--accent);
+    }
+
+    .tree-view {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 0;
+      list-style: none;
+    }
+    .tree-node {
+      padding: 5px 12px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--text-muted);
+      user-select: none;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      overflow: hidden;
+    }
+    .tree-node:hover {
+      background: var(--bg-hover);
+      color: var(--text-main);
+    }
+    .tree-node.active {
+      background: var(--bg-surface);
+      color: var(--accent-bright);
+      border-left: 3px solid var(--accent-bright);
+    }
+    .sub-tree {
+      margin-left: 14px;
+      border-left: 1px solid var(--border-color);
+    }
+
+    /* Related Notes Panel */
+    .related-panel {
+      height: 240px;
+      border-top: 1px solid var(--border-color);
+      background: rgba(0, 0, 0, 0.25);
+      display: flex;
+      flex-direction: column;
+    }
+    .related-header {
+      padding: 8px 12px;
+      font-size: 11px;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: var(--accent-bright);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      justify-content: space-between;
+    }
+    .related-list {
+      list-style: none;
+      overflow-y: auto;
+      padding: 6px;
+    }
+    .related-item {
+      padding: 5px 8px;
+      margin-bottom: 3px;
+      font-size: 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: var(--text-muted);
+      background: rgba(255, 255, 255, 0.01);
+    }
+    .related-item:hover {
+      background: var(--bg-hover);
+      color: var(--text-main);
+    }
+    .related-score {
+      font-size: 11px;
+      font-family: monospace;
+      color: var(--accent-bright);
+      background: var(--bg-surface);
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+
+    /* Main Area Layout */
+    #main-content {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background: var(--bg-base);
+    }
+
+    /* Top Toolbar */
+    .toolbar {
+      height: 48px;
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border-color);
+      gap: 12px;
+    }
+    .btn-toggle {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      border-radius: 4px;
+      padding: 4px 8px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .btn-toggle:hover {
+      color: var(--accent-bright);
+      border-color: var(--accent);
+    }
+    .title-input {
+      background: transparent;
+      border: none;
+      color: var(--text-main);
+      font-size: 15px;
+      font-weight: 600;
+      outline: none;
+      width: 320px;
+      padding: 4px 2px;
+    }
+    .title-input:focus {
+      border-bottom: 1px solid var(--accent);
+    }
+    .status-indicator {
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    /* Split Workspace */
+    .workspace {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+      position: relative;
+    }
+    .editor-pane {
+      width: 50%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-base);
+    }
+    #markdown-editor {
+      width: 100%;
+      height: 100%;
+      background: transparent;
+      border: none;
+      padding: 20px;
+      font-family: "JetBrains Mono", Consolas, "Fira Code", Menlo, monospace;
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--text-main);
+      resize: none;
+      outline: none;
+    }
+
+    /* Resizer Bar */
+    .splitter {
+      width: 6px;
+      cursor: col-resize;
+      background: var(--border-color);
+      transition: background 0.15s;
+      z-index: 2;
+    }
+    .splitter:hover, .splitter.dragging {
+      background: var(--accent);
+    }
+
+    .preview-pane {
+      flex: 1;
+      height: 100%;
+      padding: 24px;
+      overflow-y: auto;
+      background: var(--bg-panel);
+      line-height: 1.65;
+    }
+
+    /* Markdown Styling in Preview */
+    .preview-pane h1, .preview-pane h2, .preview-pane h3 {
+      color: var(--accent-bright);
+      margin-top: 1.2rem;
+      margin-bottom: 0.6rem;
+      font-weight: 600;
+    }
+    .preview-pane p {
+      margin-bottom: 0.8rem;
+    }
+    .preview-pane code {
+      background: var(--bg-surface);
+      padding: 2px 5px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 13px;
+    }
+    .preview-pane pre {
+      background: var(--bg-surface);
+      padding: 12px;
+      border-radius: 6px;
+      overflow-x: auto;
+      margin: 12px 0;
+      border: 1px solid var(--border-color);
+    }
+    .preview-pane pre code {
+      background: none;
+      padding: 0;
+    }
+    .preview-pane blockquote {
+      border-left: 3px solid var(--accent);
+      padding-left: 12px;
+      color: var(--text-muted);
+      margin: 12px 0;
+    }
+    .obsidian-link {
+      color: var(--accent-bright);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+      cursor: pointer;
+    }
+    .obsidian-link:hover {
+      color: #fff;
+    }
+    .obsidian-tag {
+      background: var(--tag-bg);
+      color: var(--accent-bright);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 500;
+      border: 1px solid rgba(199, 125, 255, 0.2);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Left Sidebar -->
+  <aside id="sidebar">
+    <div class="brand">
+      <span>MD BRAIN</span>
+      <span style="font-size: 9px; opacity: 0.6; letter-spacing: 1px;">LOCAL VAULT</span>
+    </div>
+    <div class="sidebar-actions">
+      <button class="btn-action" onclick="promptCreateFile()">+ Note</button>
+      <button class="btn-action" onclick="promptCreateFolder()">+ Folder</button>
+      <button class="btn-action" onclick="refreshTree()">Sync</button>
+    </div>
+    <div class="tree-view" id="file-tree"></div>
+    <div class="related-panel">
+      <div class="related-header">
+        <span>Related Notes</span>
+        <span style="font-size: 9px; opacity: 0.6;">EMBEDDING + GRAPH</span>
+      </div>
+      <ul class="related-list" id="related-list">
+        <li style="padding: 8px; font-size: 11px; color: var(--text-muted);">Open a note to load related links.</li>
+      </ul>
+    </div>
+  </aside>
+
+  <!-- Main Canvas -->
+  <main id="main-content">
+    <div class="toolbar">
+      <button class="btn-toggle" onclick="toggleSidebar()" title="Toggle Sidebar">☰</button>
+      <input type="text" id="note-title" class="title-input" placeholder="Select or create a note..." />
+      <span class="status-indicator" id="save-status">Ready</span>
+    </div>
+    <div class="workspace" id="workspace">
+      <div class="editor-pane" id="editor-container">
+        <textarea id="markdown-editor" placeholder="Write markdown here... Use #tags and [[Links]]"></textarea>
+      </div>
+      <div class="splitter" id="splitter"></div>
+      <div class="preview-pane" id="markdown-preview"></div>
+    </div>
+  </main>
+
+  <script>
+    let currentPath = null;
+    let saveTimeout = null;
+    let renameTimeout = null;
+
+    // DOM References
+    const sidebar = document.getElementById('sidebar');
+    const fileTree = document.getElementById('file-tree');
+    const editor = document.getElementById('markdown-editor');
+    const preview = document.getElementById('markdown-preview');
+    const titleInput = document.getElementById('note-title');
+    const saveStatus = document.getElementById('save-status');
+    const relatedList = document.getElementById('related-list');
+    const splitter = document.getElementById('splitter');
+    const editorContainer = document.getElementById('editor-container');
+    const workspace = document.getElementById('workspace');
+
+    // UI: Toggle Sidebar
+    function toggleSidebar() {
+      sidebar.classList.toggle('hidden');
+    }
+
+    // UI: Horizontal Splitter Resizing
+    let isDragging = false;
+    splitter.addEventListener('mousedown', () => {
+      isDragging = true;
+      splitter.classList.add('dragging');
+      document.body.style.cursor = 'col-resize';
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!isDragging) return;
+      const workspaceRect = workspace.getBoundingClientRect();
+      const offset = e.clientX - workspaceRect.left;
+      const minWidth = 100;
+      const maxWidth = workspaceRect.width - 100;
+      if (offset > minWidth && offset < maxWidth) {
+        editorContainer.style.width = `${offset}px`;
+      }
+    });
+
+    window.addEventListener('mouseup', () => {
+      if (isDragging) {
+        isDragging = false;
+        splitter.classList.remove('dragging');
+        document.body.style.cursor = 'default';
+      }
+    });
+
+    // Obsidian Wikilinks and Tag Rendering
+    function renderPreview(content) {
+      // Parse [[Target|Display]] or [[Target]]
+      let parsed = content.replace(/\[\[(.*?)\]\]/g, (match, inner) => {
+        const parts = inner.split('|');
+        const target = parts[0].trim();
+        const display = parts[1] ? parts[1].trim() : target;
+        return `<a class="obsidian-link" onclick="resolveWikilink('${target}')">${display}</a>`;
+      });
+
+      // Highlight #tags (not including HTML hex codes)
+      parsed = parsed.replace(/(^|\s)#([a-zA-Z0-9_\-\/]+)/g, '$1<span class="obsidian-tag">#$2</span>');
+
+      preview.innerHTML = marked.parse(parsed);
+    }
+
+    async function resolveWikilink(targetTitle) {
+      try {
+        const res = await fetch(`/api/resolve-link?target=${encodeURIComponent(targetTitle)}`);
+        if (res.ok) {
+          const data = await res.json();
+          openNote(data.path);
+        } else {
+          if (confirm(`Note "${targetTitle}" does not exist. Create it?`)) {
+            const createRes = await fetch('/api/create', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: targetTitle, is_folder: false })
+            });
+            const created = await createRes.json();
+            refreshTree();
+            openNote(created.path);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to resolve link:", err);
+      }
+    }
+
+    // Auto-Save and Rename Listeners
+    editor.addEventListener('input', () => {
+      renderPreview(editor.value);
+      saveStatus.innerText = "Editing...";
+      clearTimeout(saveTimeout);
+      saveTimeout = setTimeout(saveContent, 800);
+    });
+
+    titleInput.addEventListener('input', () => {
+      if (!currentPath) return;
+      saveStatus.innerText = "Renaming...";
+      clearTimeout(renameTimeout);
+      renameTimeout = setTimeout(renameCurrentNote, 1000);
+    });
+
+    async function saveContent() {
+      if (!currentPath) return;
+      try {
+        await fetch('/api/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: currentPath, content: editor.value })
+        });
+        saveStatus.innerText = "Saved";
+        loadRelated(currentPath);
+      } catch (err) {
+        saveStatus.innerText = "Error saving";
+      }
+    }
+
+    async function renameCurrentNote() {
+      const newTitle = titleInput.value.trim();
+      if (!newTitle || !currentPath) return;
+      try {
+        const res = await fetch('/api/rename', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ old_path: currentPath, new_title: newTitle })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          currentPath = data.new_path;
+          saveStatus.innerText = "Renamed";
+          refreshTree();
+          loadRelated(currentPath);
+        } else {
+          saveStatus.innerText = data.error || "Rename failed";
+        }
+      } catch (err) {
+        saveStatus.innerText = "Error renaming";
+      }
+    }
+
+    // Vault File Operations
+    async function openNote(relPath) {
+      currentPath = relPath;
+      const res = await fetch(`/api/note?path=${encodeURIComponent(relPath)}`);
+      if (res.ok) {
+        const data = await res.json();
+        titleInput.value = data.name;
+        editor.value = data.content;
+        renderPreview(data.content);
+        saveStatus.innerText = "Ready";
+        loadRelated(relPath);
+
+        document.querySelectorAll('.tree-node').forEach(el => {
+          el.classList.toggle('active', el.dataset.path === relPath);
+        });
+      }
+    }
+
+    async function loadRelated(relPath) {
+      const res = await fetch(`/api/related?path=${encodeURIComponent(relPath)}`);
+      const data = await res.json();
+      relatedList.innerHTML = '';
+      if (!data.related.length) {
+        relatedList.innerHTML = `<li style="padding: 8px; font-size: 11px; color: var(--text-muted);">No related notes found.</li>`;
+        return;
+      }
+      data.related.forEach(item => {
+        const li = document.createElement('li');
+        li.className = 'related-item';
+        li.innerHTML = `
+          <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 170px;">${item.title}</span>
+          <span class="related-score" title="Semantic Match: ${item.semantic_sim}">⚡${item.semantic_sim}</span>
+        `;
+        li.onclick = () => openNote(item.path);
+        relatedList.appendChild(li);
+      });
+    }
+
+    function renderTreeNodes(nodes, container) {
+      nodes.forEach(node => {
+        if (node.type === 'folder') {
+          const folderDiv = document.createElement('div');
+          folderDiv.className = 'tree-node';
+          folderDiv.innerHTML = `📁 <strong>${node.name}</strong>`;
+          container.appendChild(folderDiv);
+
+          const subTree = document.createElement('div');
+          subTree.className = 'sub-tree';
+          renderTreeNodes(node.children, subTree);
+          container.appendChild(subTree);
+        } else {
+          const fileDiv = document.createElement('div');
+          fileDiv.className = 'tree-node';
+          fileDiv.dataset.path = node.path;
+          fileDiv.innerHTML = `📄 ${node.name}`;
+          fileDiv.onclick = () => openNote(node.path);
+          if (node.path === currentPath) fileDiv.classList.add('active');
+          container.appendChild(fileDiv);
+        }
+      });
+    }
+
+    async function refreshTree() {
+      const res = await fetch('/api/tree');
+      const tree = await res.json();
+      fileTree.innerHTML = '';
+      renderTreeNodes(tree, fileTree);
+    }
+
+    async function promptCreateFile() {
+      const name = prompt("Note name:");
+      if (!name) return;
+      const res = await fetch('/api/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name, is_folder: false })
+      });
+      const data = await res.json();
+      await refreshTree();
+      openNote(data.path);
+    }
+
+    async function promptCreateFolder() {
+      const name = prompt("Folder name:");
+      if (!name) return;
+      await fetch('/api/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name, is_folder: true })
+      });
+      refreshTree();
+    }
+
+    // Boot
+    refreshTree();
+  </script>
+</body>
+</html>
