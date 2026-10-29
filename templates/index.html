@@ -301,7 +301,6 @@
       background: rgba(239, 68, 68, 0.15);
     }
 
-    /* Context Menu */
     #context-menu {
       display: none;
       position: fixed;
@@ -325,10 +324,6 @@
     }
     .context-menu-item:hover {
       background: var(--accent);
-      color: #ffffff;
-    }
-    .context-menu-item.danger:hover {
-      background: #dc2626;
       color: #ffffff;
     }
 
@@ -517,7 +512,6 @@
       cursor: pointer;
     }
 
-    /* Task & List Items */
     #preview ul, #preview ol {
       padding-left: 24px;
       margin: 8px 0;
@@ -612,6 +606,7 @@
       color: var(--text-primary);
     }
 
+    /* Graph Modal & Semantic Edges */
     #graph-modal {
       display: none;
       position: fixed;
@@ -623,10 +618,63 @@
     #graph-modal.active {
       display: flex;
     }
+    .graph-nav-bar {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 0.8rem;
+    }
+    .graph-legend {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .legend-wikilink {
+      display: inline-block;
+      width: 16px;
+      height: 2px;
+      background: var(--accent);
+      vertical-align: middle;
+      margin-right: 4px;
+    }
+    .legend-semantic {
+      display: inline-block;
+      width: 16px;
+      height: 2px;
+      border-bottom: 2px dashed #4ade80;
+      vertical-align: middle;
+      margin-right: 4px;
+    }
     #graph-viewport {
       flex: 1;
       width: 100%;
       height: 100%;
+    }
+    #graph-tooltip {
+      position: fixed;
+      display: none;
+      pointer-events: none;
+      z-index: 2600;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      color: var(--text-primary);
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
+      line-height: 1.4;
+      white-space: nowrap;
+    }
+    .graph-link-hitbox {
+      cursor: pointer;
+      fill: none;
+      stroke: transparent;
+      stroke-width: 12px;
     }
 
     @media (max-width: 768px) {
@@ -746,16 +794,34 @@
     <div id="related-list"></div>
   </aside>
 
-  <!-- Right-Click Context Menu for Tree Items -->
+  <!-- Right-Click Context Menu -->
   <div id="context-menu">
     <div class="context-menu-item" onclick="contextDelete()">🗑 Delete</div>
   </div>
 
+  <!-- Interactive Graph Modal -->
   <div id="graph-modal">
-    <div style="padding: 12px; border-bottom: 1px solid var(--border); display: flex; justify-content: flex-end;">
+    <div class="graph-nav-bar">
+      <div class="graph-legend">
+        <span><span class="legend-wikilink"></span> WikiLink</span>
+
+        <label style="display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;">
+          <input type="checkbox" id="toggle-semantic-edges" checked onchange="toggleSemanticEdges(this.checked)" style="accent-color: var(--accent); cursor: pointer;">
+          <span><span class="legend-semantic"></span> Semantic</span>
+        </label>
+
+        <div id="semantic-slider-container" style="display: inline-flex; align-items: center; gap: 8px;">
+          <span style="color: var(--text-muted); font-size: 0.75rem;">Min Similarity:</span>
+          <input type="range" id="semantic-threshold-slider" min="50" max="90" value="65" step="1"
+                 oninput="handleSemanticThresholdChange(this.value)"
+                 style="accent-color: #4ade80; cursor: pointer; width: 90px;">
+          <span id="semantic-threshold-val" style="color: #4ade80; font-weight: bold; font-size: 0.78rem; min-width: 32px;">65%</span>
+        </div>
+      </div>
       <button class="icon-btn" onclick="toggleGraphView()">Close</button>
     </div>
     <div id="graph-viewport"></div>
+    <div id="graph-tooltip"></div>
   </div>
 
   <script>
@@ -768,6 +834,9 @@
     let activeFolderFilter = null;
     let contextItem = null;
 
+    let graphEdgesSelection = null;
+    let graphSimulation = null;
+
     const fileTree = document.getElementById("file-tree");
     const searchResults = document.getElementById("search-results");
     const searchInput = document.getElementById("search-input");
@@ -778,6 +847,7 @@
     const previewPane = document.getElementById("preview");
     const mobileBackdrop = document.getElementById("mobile-backdrop");
     const contextMenu = document.getElementById("context-menu");
+    const graphTooltip = document.getElementById("graph-tooltip");
 
     function isMobile() { return window.innerWidth <= 768; }
 
@@ -864,7 +934,6 @@
       }
     }
 
-    // Context Menu for Right-Click Delete
     function openContextMenu(e, canonicalName, isFolder) {
       e.preventDefault();
       contextItem = { path: canonicalName, isFolder };
@@ -894,7 +963,6 @@
       });
 
       if (res.ok) {
-        // Clear editor if the open note or its containing folder was deleted
         if (currentCanonical === canonicalName || (isFolder && currentCanonical && currentCanonical.startsWith(canonicalName + "/"))) {
           currentCanonical = null;
           noteNameInput.value = "";
@@ -1139,7 +1207,7 @@
       }, 500);
     });
 
-    // Keyboard Shortcuts: Enter list continuation & Ctrl+Enter task toggle
+    // Keyboard Shortcuts: Enter continuation & Ctrl+Enter task toggle
     markdownInput.addEventListener("keydown", (e) => {
       const textarea = markdownInput;
       const text = textarea.value;
@@ -1432,7 +1500,7 @@
       triggerSearch();
     }
 
-    // Title Bar Path Tab Completion
+    // Header Path Tab-Completion
     let tabCompletionState = {
       active: false,
       candidates: [],
@@ -1627,48 +1695,186 @@
       }
     });
 
+    // D3 Graph View & Semantic Association
     function toggleGraphView() {
       const modal = document.getElementById("graph-modal");
       modal.classList.toggle("active");
-      if (modal.classList.contains("active")) renderGraph();
+      if (modal.classList.contains("active")) {
+        renderGraph();
+      } else {
+        if (graphSimulation) graphSimulation.stop();
+        graphTooltip.style.display = "none";
+      }
+    }
+
+    function toggleSemanticEdges(show) {
+      const sliderContainer = document.getElementById("semantic-slider-container");
+      if (sliderContainer) {
+        sliderContainer.style.opacity = show ? "1" : "0.4";
+        sliderContainer.style.pointerEvents = show ? "auto" : "none";
+      }
+      handleSemanticThresholdChange(document.getElementById("semantic-threshold-slider")?.value || 65);
+    }
+
+    function handleSemanticThresholdChange(val) {
+      document.getElementById("semantic-threshold-val").textContent = `${val}%`;
+      const threshold = parseFloat(val) / 100.0;
+      const isEnabled = document.getElementById("toggle-semantic-edges")?.checked ?? true;
+
+      if (!graphEdgesSelection) return;
+
+      graphEdgesSelection
+        .filter(d => d.type === "semantic")
+        .transition()
+        .duration(120)
+        .style("opacity", d => (isEnabled && d.similarity >= threshold) ? 0.55 : 0);
+
+      d3.selectAll(".graph-link-hitbox")
+        .filter(d => d.type === "semantic")
+        .style("pointer-events", d => (isEnabled && d.similarity >= threshold) ? "stroke" : "none");
     }
 
     async function renderGraph() {
       const container = document.getElementById("graph-viewport");
       container.innerHTML = "";
       const width = container.clientWidth || window.innerWidth;
-      const height = container.clientHeight || window.innerHeight;
+      const height = container.clientHeight || (window.innerHeight - 56);
+
+      if (graphSimulation) graphSimulation.stop();
 
       const res = await fetch("/api/graph");
       const data = await res.json();
 
-      const svg = d3.select(container).append("svg").attr("width", width).attr("height", height);
+      const showSemantic = document.getElementById("toggle-semantic-edges")?.checked ?? true;
+      const initialThreshold = parseFloat(document.getElementById("semantic-threshold-slider")?.value || 65) / 100.0;
+
+      const svg = d3.select(container)
+        .append("svg")
+        .attr("width", "100%")
+        .attr("height", "100%")
+        .attr("viewBox", [0, 0, width, height]);
+
       const g = svg.append("g");
 
-      svg.call(d3.zoom().on("zoom", (e) => g.attr("transform", e.transform)));
+      svg.call(d3.zoom().scaleExtent([0.1, 4]).on("zoom", (e) => {
+        g.attr("transform", e.transform);
+        graphTooltip.style.display = "none";
+      }));
 
-      const sim = d3.forceSimulation(data.nodes)
-        .force("link", d3.forceLink(data.links).id(d => d.id).distance(90))
-        .force("charge", d3.forceManyBody().strength(-200))
-        .force("center", d3.forceCenter(width / 2, height / 2));
+      graphSimulation = d3.forceSimulation(data.nodes)
+        .force("link", d3.forceLink(data.links).id(d => d.id).distance(100))
+        .force("charge", d3.forceManyBody().strength(-260))
+        .force("center", d3.forceCenter(width / 2, height / 2))
+        .force("collision", d3.forceCollide().radius(26));
 
-      const link = g.append("g").selectAll("line").data(data.links).join("line").attr("stroke", "#8b5cf6").attr("stroke-width", 1.5);
-      const node = g.append("g").selectAll("circle").data(data.nodes).join("circle").attr("r", 7).attr("fill", "#c084fc").call(
-        d3.drag()
-          .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+      const linkGroup = g.append("g").attr("class", "links-layer");
+
+      graphEdgesSelection = linkGroup
+        .selectAll("line.visual-line")
+        .data(data.links)
+        .join("line")
+        .attr("class", d => `visual-line ${d.type === "semantic" ? "graph-link-semantic" : "graph-link-wikilink"}`)
+        .attr("stroke", d => d.type === "wikilink" ? "#8b5cf6" : "#4ade80")
+        .attr("stroke-width", d => d.type === "wikilink" ? 2 : 1.5)
+        .attr("stroke-dasharray", d => d.type === "semantic" ? "4,4" : "none")
+        .style("opacity", d => {
+          if (d.type === "wikilink") return 0.65;
+          return (showSemantic && d.similarity >= initialThreshold) ? 0.55 : 0;
+        });
+
+      linkGroup
+        .selectAll("line.graph-link-hitbox")
+        .data(data.links)
+        .join("line")
+        .attr("class", "graph-link-hitbox")
+        .style("pointer-events", d => {
+          if (d.type === "wikilink") return "stroke";
+          return (showSemantic && d.similarity >= initialThreshold) ? "stroke" : "none";
+        })
+        .on("mouseenter", function (event, d) {
+          const index = data.links.indexOf(d);
+          graphEdgesSelection.filter((_, i) => i === index)
+            .transition()
+            .duration(80)
+            .style("opacity", 1.0)
+            .attr("stroke-width", 2.8);
+
+          const s = typeof d.source === "object" ? d.source.id : d.source;
+          const t = typeof d.target === "object" ? d.target.id : d.target;
+
+          if (d.type === "semantic") {
+            graphTooltip.innerHTML = `
+              <div style="color: #4ade80; font-weight: bold; margin-bottom: 2px;">⚡ Semantic Association</div>
+              <div>${s} ↔ ${t}</div>
+              <div style="color: var(--text-muted); margin-top: 2px;">Similarity: <strong style="color: #4ade80;">${Math.round(d.similarity * 100)}%</strong></div>
+            `;
+          } else {
+            graphTooltip.innerHTML = `
+              <div style="color: var(--accent); font-weight: bold; margin-bottom: 2px;">🔗 WikiLink</div>
+              <div>${s} → ${t}</div>
+            `;
+          }
+
+          graphTooltip.style.display = "block";
+          graphTooltip.style.left = `${Math.min(event.clientX + 14, window.innerWidth - 180)}px`;
+          graphTooltip.style.top = `${Math.max(14, event.clientY - 14)}px`;
+        })
+        .on("mousemove", function (event) {
+          graphTooltip.style.left = `${Math.min(event.clientX + 14, window.innerWidth - 180)}px`;
+          graphTooltip.style.top = `${Math.max(14, event.clientY - 14)}px`;
+        })
+        .on("mouseleave", function (event, d) {
+          const index = data.links.indexOf(d);
+          const currThresh = parseFloat(document.getElementById("semantic-threshold-slider")?.value || 65) / 100.0;
+          const isEnabled = document.getElementById("toggle-semantic-edges")?.checked ?? true;
+
+          graphEdgesSelection.filter((_, i) => i === index)
+            .transition()
+            .duration(120)
+            .style("opacity", d.type === "wikilink" ? 0.65 : ((isEnabled && d.similarity >= currThresh) ? 0.55 : 0))
+            .attr("stroke-width", d.type === "wikilink" ? 2 : 1.5);
+
+          graphTooltip.style.display = "none";
+        });
+
+      const node = g.append("g")
+        .selectAll("g")
+        .data(data.nodes)
+        .join("g")
+        .style("cursor", "pointer")
+        .call(d3.drag()
+          .on("start", (e, d) => { if (!e.active) graphSimulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
           .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
-          .on("end", (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
-      ).on("click", (e, d) => {
-        toggleGraphView();
-        openNote(d.id);
-      });
+          .on("end", (e, d) => { if (!e.active) graphSimulation.alphaTarget(0); d.fx = null; d.fy = null; })
+        )
+        .on("click", (e, d) => {
+          toggleGraphView();
+          openNote(d.id);
+        });
 
-      const label = g.append("g").selectAll("text").data(data.nodes).join("text").text(d => d.title).attr("font-size", "10px").attr("fill", "#ede9fe").attr("dx", 10).attr("dy", 3);
+      node.append("circle")
+        .attr("r", d => d.id === currentCanonical ? 9 : 7)
+        .attr("fill", d => d.id === currentCanonical ? "#c084fc" : "#7c3aed")
+        .attr("stroke", d => d.id === currentCanonical ? "#ffffff" : "#c4b5fd")
+        .attr("stroke-width", d => d.id === currentCanonical ? 2.5 : 1.5);
 
-      sim.on("tick", () => {
-        link.attr("x1", d => d.source.x).attr("y1", d => d.source.y).attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-        node.attr("cx", d => d.x).attr("cy", d => d.y);
-        label.attr("x", d => d.x).attr("y", d => d.y);
+      node.append("text")
+        .text(d => d.title)
+        .attr("x", 12)
+        .attr("y", 4)
+        .attr("fill", "#ede9fe")
+        .attr("font-size", "11px")
+        .attr("font-weight", d => d.id === currentCanonical ? "bold" : "normal")
+        .attr("pointer-events", "none");
+
+      graphSimulation.on("tick", () => {
+        linkGroup.selectAll("line")
+          .attr("x1", d => d.source.x)
+          .attr("y1", d => d.source.y)
+          .attr("x2", d => d.target.x)
+          .attr("y2", d => d.target.y);
+
+        node.attr("transform", d => `translate(${d.x},${d.y})`);
       });
     }
 
