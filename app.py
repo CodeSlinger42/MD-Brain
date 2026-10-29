@@ -1,370 +1,661 @@
 import os
 import re
+import shutil
 import sqlite3
-from pathlib import Path
-from flask import Flask, jsonify, render_template, request
+from datetime import datetime
+from collections import Counter
 import numpy as np
-from sentence_transformers import SentenceTransformer
-
-APP_DIR = Path(__file__).resolve().parent
-VAULT_DIR = APP_DIR / "vault"
-DB_PATH = APP_DIR / "brain.db"
-
-VAULT_DIR.mkdir(parents=True, exist_ok=True)
+from flask import Flask, request, jsonify, render_template
+from fastembed import TextEmbedding
 
 app = Flask(__name__)
+VAULT_DIR = os.path.abspath("vault")
+DB_PATH = "vault_metadata.db"
 
-# Initialize local embedding model (runs completely offline after initial download)
-MODEL_NAME = "all-MiniLM-L6-v2"
-embedder = SentenceTransformer(MODEL_NAME)
+os.makedirs(VAULT_DIR, exist_ok=True)
 
-# --- SQLite Vector Serialization Helpers ---
-
-def serialize_vector(vector: np.ndarray) -> bytes:
-    """Packs float32 numpy array into raw byte blob."""
-    return vector.astype(np.float32).tobytes()
-
-def deserialize_vector(blob: bytes) -> np.ndarray:
-    """Reads raw byte blob back into float32 numpy array."""
-    if not blob:
-        return np.zeros(384, dtype=np.float32)
-    return np.frombuffer(blob, dtype=np.float32)
-
-def cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
-    norm1 = np.linalg.norm(v1)
-    norm2 = np.linalg.norm(v2)
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-    return float(np.dot(v1, v2) / (norm1 * norm2))
-
-# --- Database & Indexing Engine ---
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# Local embedding model (~100MB footprint)
+model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 def init_db():
-    with get_db() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                rel_path TEXT UNIQUE NOT NULL,
-                filename TEXT NOT NULL,
-                title TEXT NOT NULL,
-                mtime REAL NOT NULL,
-                content TEXT NOT NULL,
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS file_embeddings (
+                rel_path TEXT PRIMARY KEY,
+                content_hash TEXT,
+                tags TEXT,
                 embedding BLOB
-            );
-
-            CREATE TABLE IF NOT EXISTS tags (
-                note_id INTEGER,
-                tag TEXT,
-                PRIMARY KEY (note_id, tag),
-                FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS links (
-                source_id INTEGER,
-                target_title TEXT,
-                FOREIGN KEY (source_id) REFERENCES notes(id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_notes_rel_path ON notes(rel_path);
-            CREATE INDEX IF NOT EXISTS idx_notes_title ON notes(title);
-            CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
-            CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_title);
+            )
         """)
+        conn.commit()
 
-def extract_metadata(content: str):
-    # Obsidian tags: #tag_name (exclude pure numeric tags)
-    raw_tags = re.findall(r'(?<=^|\s)#([a-zA-Z0-9_\-\/]+)', content)
-    tags = set([t.lower() for t in raw_tags if not t.isdigit()])
+init_db()
 
-    # Obsidian wikilinks: [[Target Note]] or [[Target Note|Display Text]]
-    raw_links = re.findall(r'\[\[(.*?)\]\]', content)
-    links = set()
-    for link in raw_links:
-        target = link.split('|')[0].strip()
-        if target:
-            links.add(target.lower())
+def clean_canonical_name(raw_name):
+    """
+    Normalizes any input path into standard 'folder/filename' without .md
+    e.g. '/misc\\sub/note.md' -> 'misc/sub/note'
+    """
+    if not raw_name:
+        return ""
+    cleaned = raw_name.strip().replace("\\", "/")
+    cleaned = re.sub(r"^/+", "", cleaned)
+    cleaned = re.sub(r"\.md$", "", cleaned, flags=re.IGNORECASE)
+    parts = [re.sub(r'[\\*?:"<>|]', "", p).strip() for p in cleaned.split("/") if p.strip()]
+    return "/".join(parts)
 
-    return list(tags), list(links)
+def extract_metadata(content):
+    raw_tags = re.findall(r"(?:(?<=\s)|(?<=^))#([a-zA-Z0-9_\-\/]+)", content)
+    wikilinks = re.findall(r"\[\[(.*?)\]\]", content)
+    clean_wikilinks = [clean_canonical_name(link.split("|")[0]) for link in wikilinks]
+    return list(set(raw_tags)), [w for w in clean_wikilinks if w]
 
-def compute_embedding(text: str) -> bytes:
-    # Remove basic markdown formatting characters to stabilize vector semantics
-    clean_text = re.sub(r'[#*`\[\]\(\)]', ' ', text).strip()
-    if not clean_text:
-        return serialize_vector(np.zeros(384, dtype=np.float32))
-    
-    vec = embedder.encode(clean_text, normalize_embeddings=True)
-    return serialize_vector(vec)
+def extract_first_heading(content):
+    match = re.search(r"^(?:#{1,2})\s+(.+)$", content, re.MULTILINE)
+    if not match:
+        return None
+    raw_title = match.group(1).strip()
+    return clean_canonical_name(raw_title)[:100]
 
-def index_file(rel_path: str, conn):
-    abs_path = VAULT_DIR / rel_path
-    if not abs_path.is_file():
-        return
+def get_or_update_embedding(rel_path, content):
+    import hashlib
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    tags, _ = extract_metadata(content)
+    tags_str = ",".join(tags)
 
-    mtime = abs_path.stat().st_mtime
-    try:
-        content = abs_path.read_text(encoding="utf-8")
-    except Exception:
-        content = ""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT content_hash, embedding FROM file_embeddings WHERE rel_path = ?", (rel_path,))
+        row = cursor.fetchone()
 
-    filename = abs_path.name
-    title = abs_path.stem
+        if row and row[0] == content_hash:
+            embedding = np.frombuffer(row[1], dtype=np.float32)
+            cursor.execute("UPDATE file_embeddings SET tags = ? WHERE rel_path = ?", (tags_str, rel_path))
+            conn.commit()
+            return embedding
 
-    tags, links = extract_metadata(content)
-    embedding_blob = compute_embedding(content)
+        embedding = list(model.embed([content]))[0].astype(np.float32)
+        cursor.execute("""
+            INSERT INTO file_embeddings (rel_path, content_hash, tags, embedding)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(rel_path) DO UPDATE SET
+                content_hash=excluded.content_hash,
+                tags=excluded.tags,
+                embedding=excluded.embedding
+        """, (rel_path, content_hash, tags_str, embedding.tobytes()))
+        conn.commit()
+    return embedding
 
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO notes (rel_path, filename, title, mtime, content, embedding)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(rel_path) DO UPDATE SET
-            filename=excluded.filename,
-            title=excluded.title,
-            mtime=excluded.mtime,
-            content=excluded.content,
-            embedding=excluded.embedding
-    """, (rel_path, filename, title, mtime, content, embedding_blob))
+def refactor_wikilinks_vault(old_prefix, new_prefix, is_folder=False):
+    """
+    Scans entire vault and updates WikiLinks when notes or folders change.
+    Handles exact links, aliased links [[target|alias]], and folder subpaths.
+    """
+    if not old_prefix or not new_prefix or old_prefix.lower() == new_prefix.lower():
+        return 0
 
-    note_id = cursor.execute("SELECT id FROM notes WHERE rel_path = ?", (rel_path,)).fetchone()[0]
+    if is_folder:
+        pattern = re.compile(
+            rf"\[\[({re.escape(old_prefix)}/.*?)(\|.*?)?\]\]",
+            re.IGNORECASE
+        )
+    else:
+        pattern = re.compile(
+            rf"\[\[{re.escape(old_prefix)}(\|.*?)?\]\]",
+            re.IGNORECASE
+        )
 
-    cursor.execute("DELETE FROM tags WHERE note_id = ?", (note_id,))
-    cursor.execute("DELETE FROM links WHERE source_id = ?", (note_id,))
+    updated_count = 0
 
-    for tag in tags:
-        cursor.execute("INSERT OR IGNORE INTO tags (note_id, tag) VALUES (?, ?)", (note_id, tag))
-    for target in links:
-        cursor.execute("INSERT INTO links (source_id, target_title) VALUES (?, ?)", (note_id, target))
+    for root, _, files in os.walk(VAULT_DIR):
+        for f in files:
+            if not f.endswith(".md"):
+                continue
 
-def sync_cache():
-    """Invalidates modified or deleted files based on disk mtime comparisons."""
-    disk_files = {}
-    for p in VAULT_DIR.rglob("*.md"):
-        rel = p.relative_to(VAULT_DIR).as_posix()
-        disk_files[rel] = p.stat().st_mtime
+            full_path = os.path.join(root, f)
+            rel_file = os.path.relpath(full_path, VAULT_DIR).replace("\\", "/")
 
-    with get_db() as conn:
-        db_rows = conn.execute("SELECT id, rel_path, mtime, embedding FROM notes").fetchall()
-        db_files = {row["rel_path"]: (row["id"], row["mtime"], row["embedding"]) for row in db_rows}
+            with open(full_path, "r", encoding="utf-8") as file:
+                content = file.read()
 
-        # Remove deleted disk files from DB
-        for rel_path, (note_id, _, _) in db_files.items():
-            if rel_path not in disk_files:
-                conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+            if not pattern.search(content):
+                continue
 
-        # Re-index files that are new, updated, or missing an embedding
-        for rel_path, mtime in disk_files.items():
-            if (rel_path not in db_files or 
-                db_files[rel_path][1] != mtime or 
-                db_files[rel_path][2] is None):
-                index_file(rel_path, conn)
+            def replace_match(m):
+                if is_folder:
+                    old_full_target = m.group(1)
+                    alias_part = m.group(2) or ""
+                    sub_path = old_full_target[len(old_prefix) + 1:]
+                    return f"[[{new_prefix}/{sub_path}{alias_part}]]"
+                else:
+                    alias_part = m.group(1) or ""
+                    return f"[[{new_prefix}{alias_part}]]"
 
-def build_tree(root_dir: Path):
-    tree = {"name": "", "path": "", "type": "folder", "children": []}
+            new_content = pattern.sub(replace_match, content)
 
-    def walk(current_dir: Path, node: dict):
-        entries = sorted(list(current_dir.iterdir()), key=lambda e: (not e.is_dir(), e.name.lower()))
-        for entry in entries:
-            rel = entry.relative_to(VAULT_DIR).as_posix()
-            if entry.is_dir():
-                folder_node = {"name": entry.name, "path": rel, "type": "folder", "children": []}
-                node["children"].append(folder_node)
-                walk(entry, folder_node)
-            elif entry.suffix.lower() == ".md":
-                node["children"].append({
-                    "name": entry.stem,
-                    "filename": entry.name,
-                    "path": rel,
-                    "type": "file"
-                })
+            if new_content != content:
+                with open(full_path, "w", encoding="utf-8") as file:
+                    file.write(new_content)
+                get_or_update_embedding(rel_file, new_content)
+                updated_count += 1
 
-    walk(root_dir, tree)
-    return tree["children"]
-
-# --- API Endpoints ---
+    return updated_count
 
 @app.route("/")
 def index():
     return render_template("index.html")
 
-@app.route("/api/tree")
+@app.route("/api/tree", methods=["GET"])
 def get_tree():
-    sync_cache()
-    return jsonify(build_tree(VAULT_DIR))
+    def scan_dir(path):
+        tree = []
+        for entry in sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower())):
+            rel_path = os.path.relpath(entry.path, VAULT_DIR).replace("\\", "/")
+            if entry.is_dir():
+                tree.append({
+                    "name": entry.name,
+                    "path": rel_path,
+                    "canonical_name": clean_canonical_name(rel_path),
+                    "type": "folder",
+                    "children": scan_dir(entry.path)
+                })
+            elif entry.name.endswith(".md"):
+                tree.append({
+                    "name": entry.name[:-3],
+                    "path": rel_path,
+                    "canonical_name": clean_canonical_name(rel_path),
+                    "type": "file"
+                })
+        return tree
+    return jsonify(scan_dir(VAULT_DIR))
 
 @app.route("/api/note", methods=["GET"])
 def get_note():
-    rel_path = request.args.get("path")
-    if not rel_path:
-        return jsonify({"error": "Path required"}), 400
+    rel_path = request.args.get("path", "")
+    canonical = clean_canonical_name(rel_path)
+    rel_file = f"{canonical}.md"
+    full_path = os.path.normpath(os.path.join(VAULT_DIR, rel_file))
 
-    abs_path = (VAULT_DIR / rel_path).resolve()
-    if not abs_path.is_file() or not str(abs_path).startswith(str(VAULT_DIR.resolve())):
-        return jsonify({"error": "File not found"}), 404
+    if not full_path.startswith(VAULT_DIR) or not os.path.exists(full_path):
+        return jsonify({"error": "Note not found"}), 404
 
-    content = abs_path.read_text(encoding="utf-8")
+    with open(full_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    tags, links = extract_metadata(content)
     return jsonify({
-        "path": rel_path,
-        "name": abs_path.stem,
-        "content": content
+        "path": rel_file,
+        "canonical_name": canonical,
+        "content": content,
+        "tags": tags,
+        "links": links
     })
 
 @app.route("/api/save", methods=["POST"])
 def save_note():
-    data = request.json or {}
-    rel_path = data.get("path")
+    data = request.json
+    raw_path = data.get("path")
     content = data.get("content", "")
+    allow_overwrite = data.get("allow_overwrite", True)
 
-    if not rel_path:
-        return jsonify({"error": "Path required"}), 400
+    if not raw_path:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        canonical = f"Untitled-{ts}"
+    else:
+        canonical = clean_canonical_name(raw_path)
 
-    abs_path = (VAULT_DIR / rel_path).resolve()
-    if not str(abs_path).startswith(str(VAULT_DIR.resolve())):
-        return jsonify({"error": "Invalid path"}), 403
+    if not canonical:
+        return jsonify({"error": "Invalid name"}), 400
 
-    abs_path.parent.mkdir(parents=True, exist_ok=True)
-    abs_path.write_text(content, encoding="utf-8")
+    rel_file = f"{canonical}.md"
+    full_path = os.path.normpath(os.path.join(VAULT_DIR, rel_file))
 
-    with get_db() as conn:
-        index_file(rel_path, conn)
+    if not full_path.startswith(VAULT_DIR):
+        return jsonify({"error": "Invalid path"}), 400
 
-    return jsonify({"status": "saved", "path": rel_path})
+    if not allow_overwrite and os.path.exists(full_path):
+        return jsonify({"status": "exists", "path": rel_file, "canonical_name": canonical}), 200
+
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    with open(full_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    if os.path.basename(canonical).startswith("Untitled-"):
+        first_heading = extract_first_heading(content)
+        if first_heading:
+            parent_folder = os.path.dirname(canonical)
+            target_canonical = f"{parent_folder}/{first_heading}" if parent_folder else first_heading
+            target_file = f"{target_canonical}.md"
+            target_full = os.path.normpath(os.path.join(VAULT_DIR, target_file))
+
+            if not os.path.exists(target_full) or target_full == full_path:
+                if target_full != full_path:
+                    os.rename(full_path, target_full)
+                    with sqlite3.connect(DB_PATH) as conn:
+                        conn.execute("UPDATE file_embeddings SET rel_path = ? WHERE rel_path = ?", (target_file, rel_file))
+                        conn.commit()
+                    refactor_wikilinks_vault(canonical, target_canonical, is_folder=False)
+                    canonical = target_canonical
+                    rel_file = target_file
+
+    get_or_update_embedding(rel_file, content)
+    return jsonify({"status": "saved", "path": rel_file, "canonical_name": canonical})
 
 @app.route("/api/rename", methods=["POST"])
 def rename_note():
-    data = request.json or {}
-    old_rel = data.get("old_path")
-    new_title = data.get("new_title", "").strip()
+    old_raw = request.json.get("old_path", "")
+    new_raw = request.json.get("new_path", "")
+    is_folder = request.json.get("is_folder", False)
 
-    if not old_rel or not new_title:
-        return jsonify({"error": "Old path and new title required"}), 400
+    old_canonical = clean_canonical_name(old_raw)
+    new_canonical = clean_canonical_name(new_raw)
 
-    old_abs = (VAULT_DIR / old_rel).resolve()
-    if not old_abs.is_file() or not str(old_abs).startswith(str(VAULT_DIR.resolve())):
-        return jsonify({"error": "File not found"}), 404
+    if not old_canonical or not new_canonical:
+        return jsonify({"error": "Paths cannot be empty"}), 400
 
-    new_rel = (Path(old_rel).parent / f"{new_title}.md").as_posix()
-    new_abs = (VAULT_DIR / new_rel).resolve()
-
-    if new_abs.exists() and new_abs != old_abs:
-        return jsonify({"error": "File name already exists"}), 409
-
-    old_abs.rename(new_abs)
-
-    with get_db() as conn:
-        conn.execute("DELETE FROM notes WHERE rel_path = ?", (old_rel,))
-        index_file(new_rel, conn)
-
-    return jsonify({"status": "renamed", "new_path": new_rel, "new_title": new_title})
-
-@app.route("/api/create", methods=["POST"])
-def create_entry():
-    data = request.json or {}
-    folder = data.get("folder", "").strip()
-    name = data.get("name", "Untitled").strip()
-    is_folder = data.get("is_folder", False)
-
-    base = VAULT_DIR / folder if folder else VAULT_DIR
+    if old_canonical.lower() == new_canonical.lower():
+        return jsonify({"status": "noop", "new_canonical_name": old_canonical, "refactored_notes_count": 0})
 
     if is_folder:
-        target = (base / name).resolve()
-        target.mkdir(parents=True, exist_ok=True)
-        return jsonify({"status": "created", "path": target.relative_to(VAULT_DIR).as_posix()})
+        old_full = os.path.normpath(os.path.join(VAULT_DIR, old_canonical))
+        new_full = os.path.normpath(os.path.join(VAULT_DIR, new_canonical))
     else:
-        file_path = f"{name}.md" if not name.endswith(".md") else name
-        target = (base / file_path).resolve()
-        if not target.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(f"# {Path(name).stem}\n\n", encoding="utf-8")
-        rel = target.relative_to(VAULT_DIR).as_posix()
-        with get_db() as conn:
-            index_file(rel, conn)
-        return jsonify({"status": "created", "path": rel})
+        old_full = os.path.normpath(os.path.join(VAULT_DIR, f"{old_canonical}.md"))
+        new_full = os.path.normpath(os.path.join(VAULT_DIR, f"{new_canonical}.md"))
 
-@app.route("/api/related", methods=["GET"])
-def get_related():
-    rel_path = request.args.get("path")
-    sync_cache()
+    if not old_full.startswith(VAULT_DIR) or not new_full.startswith(VAULT_DIR):
+        return jsonify({"error": "Forbidden path"}), 400
 
-    with get_db() as conn:
-        curr = conn.execute("SELECT id, title, embedding FROM notes WHERE rel_path = ?", (rel_path,)).fetchone()
-        if not curr:
-            return jsonify({"related": []})
+    if not os.path.exists(old_full):
+        return jsonify({"error": "Item does not exist"}), 404
 
-        curr_id = curr["id"]
-        curr_title = curr["title"].lower()
-        curr_vec = deserialize_vector(curr["embedding"])
+    if os.path.exists(new_full):
+        return jsonify({"error": "Target already exists"}), 409
 
-        # 1. Structural score: Wikilinks (3.0 pts) & Shared Tags (1.0 pt each)
-        struct_query = """
-            WITH link_matches AS (
-                SELECT n.id, 3.0 AS score
-                FROM notes n
-                JOIN links l ON lower(l.target_title) = lower(n.title)
-                WHERE l.source_id = :id AND n.id != :id
-                UNION ALL
-                SELECT l.source_id AS id, 3.0 AS score
-                FROM links l
-                WHERE lower(l.target_title) = :title AND l.source_id != :id
-            ),
-            tag_matches AS (
-                SELECT t2.note_id AS id, CAST(COUNT(t2.tag) AS REAL) AS score
-                FROM tags t1
-                JOIN tags t2 ON t1.tag = t2.tag
-                WHERE t1.note_id = :id AND t2.note_id != :id
-                GROUP BY t2.note_id
-            ),
-            combined AS (
-                SELECT id, score FROM link_matches
-                UNION ALL
-                SELECT id, score FROM tag_matches
-            )
-            SELECT id, SUM(score) as total_struct_score
-            FROM combined
-            GROUP BY id;
-        """
-        struct_rows = conn.execute(struct_query, {"id": curr_id, "title": curr_title}).fetchall()
-        struct_scores = {row["id"]: row["total_struct_score"] for row in struct_rows}
+    os.makedirs(os.path.dirname(new_full), exist_ok=True)
+    os.rename(old_full, new_full)
 
-        # 2. Semantic vector scan using cosine distance
-        all_notes = conn.execute("SELECT id, title, rel_path, embedding FROM notes WHERE id != ?", (curr_id,)).fetchall()
-        
-        candidates = []
-        for note in all_notes:
-            nid = note["id"]
-            other_vec = deserialize_vector(note["embedding"])
-            sim = max(0.0, cosine_similarity(curr_vec, other_vec))
-            
-            # Semantic weight (0.0 - 5.0)
-            semantic_score = sim * 5.0
-            structural_score = struct_scores.get(nid, 0.0)
-            total_score = structural_score + semantic_score
-            
-            # Return notes if there is sufficient similarity or structural ties
-            if sim > 0.20 or structural_score > 0:
-                candidates.append({
-                    "title": note["title"],
-                    "path": note["rel_path"],
-                    "score": round(total_score, 2),
-                    "semantic_sim": f"{int(sim * 100)}%"
-                })
+    # Clean up empty parent directories left behind
+    old_parent = os.path.dirname(old_full)
+    while old_parent != VAULT_DIR and os.path.isdir(old_parent):
+        if not os.listdir(old_parent):
+            try:
+                os.rmdir(old_parent)
+                old_parent = os.path.dirname(old_parent)
+            except OSError:
+                break
+        else:
+            break
 
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-        return jsonify({"related": candidates[:12]})
+    # Synchronize SQLite embedding records
+    with sqlite3.connect(DB_PATH) as conn:
+        if is_folder:
+            old_pfx = f"{old_canonical}/"
+            new_pfx = f"{new_canonical}/"
+            cursor = conn.cursor()
+            cursor.execute("SELECT rel_path FROM file_embeddings WHERE rel_path LIKE ?", (f"{old_canonical}/%.md",))
+            for (p,) in cursor.fetchall():
+                sub = p[len(old_pfx):]
+                updated_p = f"{new_pfx}{sub}"
+                cursor.execute("UPDATE file_embeddings SET rel_path = ? WHERE rel_path = ?", (updated_p, p))
+        else:
+            conn.execute("UPDATE file_embeddings SET rel_path = ? WHERE rel_path = ?", (f"{new_canonical}.md", f"{old_canonical}.md"))
+        conn.commit()
+
+    # Automatically update all WikiLinks in existing notes
+    refactored_count = refactor_wikilinks_vault(old_canonical, new_canonical, is_folder=is_folder)
+
+    return jsonify({
+        "status": "renamed",
+        "new_path": f"{new_canonical}.md" if not is_folder else new_canonical,
+        "new_canonical_name": new_canonical,
+        "refactored_notes_count": refactored_count
+    })
+
+@app.route("/api/delete", methods=["POST"])
+def delete_item():
+    rel_raw = request.json.get("path", "")
+    canonical = clean_canonical_name(rel_raw)
+
+    file_candidate = os.path.normpath(os.path.join(VAULT_DIR, f"{canonical}.md"))
+    dir_candidate = os.path.normpath(os.path.join(VAULT_DIR, canonical))
+
+    if os.path.isfile(file_candidate):
+        os.remove(file_candidate)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM file_embeddings WHERE rel_path = ?", (f"{canonical}.md",))
+            conn.commit()
+    elif os.path.isdir(dir_candidate) and dir_candidate != VAULT_DIR:
+        shutil.rmtree(dir_candidate)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM file_embeddings WHERE rel_path LIKE ? OR rel_path = ?", (f"{canonical}/%", f"{canonical}.md"))
+            conn.commit()
+    else:
+        return jsonify({"error": "Item not found"}), 404
+
+    # Prune empty parent folders
+    parent = os.path.dirname(file_candidate if os.path.isfile(file_candidate) else dir_candidate)
+    while parent != VAULT_DIR and os.path.isdir(parent):
+        if not os.listdir(parent):
+            try:
+                os.rmdir(parent)
+                parent = os.path.dirname(parent)
+            except OSError:
+                break
+        else:
+            break
+
+    return jsonify({"status": "deleted", "canonical_name": canonical})
+
+@app.route("/api/daily-note", methods=["POST"])
+def daily_note():
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    canonical = f"Notes/{today_str}"
+    rel_file = f"{canonical}.md"
+    full_path = os.path.join(VAULT_DIR, rel_file)
+
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    if not os.path.exists(full_path):
+        initial_content = f"# {today_str}\n\n#daily\n\n"
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(initial_content)
+        get_or_update_embedding(rel_file, initial_content)
+
+    return jsonify({"path": rel_file, "canonical_name": canonical})
 
 @app.route("/api/resolve-link", methods=["GET"])
 def resolve_link():
-    target = request.args.get("target", "").strip().lower()
-    with get_db() as conn:
-        row = conn.execute("SELECT rel_path FROM notes WHERE lower(title) = ? LIMIT 1", (target,)).fetchone()
-        if row:
-            return jsonify({"path": row["rel_path"]})
-    return jsonify({"path": None}), 404
+    target = clean_canonical_name(request.args.get("target", ""))
+    if not target:
+        return jsonify({"found": False, "suggested_path": "Untitled.md", "suggested_name": "Untitled"})
+
+    target_file = f"{target}.md"
+    full_path = os.path.normpath(os.path.join(VAULT_DIR, target_file))
+
+    if full_path.startswith(VAULT_DIR) and os.path.isfile(full_path):
+        return jsonify({
+            "found": True,
+            "path": target_file,
+            "canonical_name": target
+        })
+
+    return jsonify({
+        "found": False,
+        "suggested_path": target_file,
+        "suggested_name": target
+    })
+
+@app.route("/api/backlinks", methods=["GET"])
+def get_backlinks():
+    target_raw = request.args.get("path", "")
+    target_canonical = clean_canonical_name(target_raw)
+
+    if not target_canonical:
+        return jsonify([])
+
+    backlinks = []
+
+    for root, _, files in os.walk(VAULT_DIR):
+        for f in files:
+            if not f.endswith(".md"):
+                continue
+
+            source_file = os.path.relpath(os.path.join(root, f), VAULT_DIR).replace("\\", "/")
+            source_canonical = clean_canonical_name(source_file)
+
+            if source_canonical.lower() == target_canonical.lower():
+                continue
+
+            with open(os.path.join(root, f), "r", encoding="utf-8") as file:
+                lines = file.readlines()
+
+            for line_idx, line in enumerate(lines):
+                explicit_matches = re.findall(r"\[\[(.*?)\]\]", line)
+                matched_explicitly = any(
+                    clean_canonical_name(m.split("|")[0]).lower() == target_canonical.lower()
+                    for m in explicit_matches
+                )
+
+                if matched_explicitly:
+                    snippet = line.strip()
+                    backlinks.append({
+                        "source_path": source_file,
+                        "canonical_name": source_canonical,
+                        "type": "linked",
+                        "line": line_idx + 1,
+                        "snippet": snippet[:140] + ("..." if len(snippet) > 140 else "")
+                    })
+                    break
+
+                line_without_links = re.sub(r"\[\[.*?\]\]", "", line)
+                if re.search(rf"\b{re.escape(target_canonical)}\b", line_without_links, re.IGNORECASE):
+                    snippet = line.strip()
+                    backlinks.append({
+                        "source_path": source_file,
+                        "canonical_name": source_canonical,
+                        "type": "unlinked",
+                        "line": line_idx + 1,
+                        "snippet": snippet[:140] + ("..." if len(snippet) > 140 else "")
+                    })
+                    break
+
+    return jsonify(backlinks)
+
+@app.route("/api/related", methods=["GET"])
+def get_related():
+    canonical = clean_canonical_name(request.args.get("path", ""))
+    rel_file = f"{canonical}.md"
+    full_path = os.path.normpath(os.path.join(VAULT_DIR, rel_file))
+
+    if not os.path.exists(full_path):
+        return jsonify([])
+
+    with open(full_path, "r", encoding="utf-8") as f:
+        curr_content = f.read()
+
+    curr_emb = get_or_update_embedding(rel_file, curr_content)
+
+    results = []
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT rel_path, tags, embedding FROM file_embeddings WHERE rel_path != ?", (rel_file,))
+        rows = cursor.fetchall()
+
+    for other_file, tags, raw_emb in rows:
+        if not os.path.exists(os.path.join(VAULT_DIR, other_file)):
+            continue
+        other_emb = np.frombuffer(raw_emb, dtype=np.float32)
+        score = float(np.dot(curr_emb, other_emb) / (np.linalg.norm(curr_emb) * np.linalg.norm(other_emb) + 1e-9))
+        other_canonical = clean_canonical_name(other_file)
+        results.append({
+            "path": other_file,
+            "canonical_name": other_canonical,
+            "score": round(score, 3),
+            "tags": tags.split(",") if tags else []
+        })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return jsonify(results[:6])
+
+@app.route("/api/search", methods=["GET"])
+def search_notes():
+    raw_query = request.args.get("q", "").strip()
+    tag_param = request.args.get("tag", "").strip().lstrip("#").lower()
+    folder_param = clean_canonical_name(request.args.get("folder", "")).lower()
+
+    query_tokens = []
+    inline_paths = []
+    inline_files = []
+    inline_tags = []
+
+    if tag_param:
+        inline_tags.append(tag_param)
+    if folder_param:
+        inline_paths.append(folder_param)
+
+    tokens = re.findall(r'(?:[^\s"]+|"[^"]*")+|\S+', raw_query)
+    for tok in tokens:
+        clean_tok = tok.strip('"')
+        if clean_tok.lower().startswith(("path:", "folder:")):
+            val = clean_canonical_name(re.sub(r'^(?:path|folder):', '', clean_tok, flags=re.IGNORECASE)).lower()
+            if val:
+                inline_paths.append(val)
+        elif clean_tok.lower().startswith(("file:", "title:")):
+            val = re.sub(r'^(?:file|title):', '', clean_tok, flags=re.IGNORECASE).strip().lower()
+            if val:
+                inline_files.append(val)
+        elif clean_tok.lower().startswith("tag:"):
+            val = re.sub(r'^tag:', '', clean_tok, flags=re.IGNORECASE).strip().lstrip("#").lower()
+            if val:
+                inline_tags.append(val)
+        elif clean_tok.startswith("#") and len(clean_tok) > 1:
+            inline_tags.append(clean_tok[1:].lower())
+        else:
+            if clean_tok:
+                query_tokens.append(clean_tok)
+
+    free_text_query = " ".join(query_tokens).strip().lower()
+
+    if not free_text_query and not inline_paths and not inline_files and not inline_tags:
+        return jsonify([])
+
+    matches = []
+
+    for root, _, files in os.walk(VAULT_DIR):
+        for f in files:
+            if not f.endswith(".md"):
+                continue
+
+            rel_file = os.path.relpath(os.path.join(root, f), VAULT_DIR).replace("\\", "/")
+            canonical = clean_canonical_name(rel_file)
+            canonical_lower = canonical.lower()
+
+            if inline_paths:
+                path_match = any(
+                    canonical_lower == p or canonical_lower.startswith(f"{p}/")
+                    for p in inline_paths
+                )
+                if not path_match:
+                    continue
+
+            if inline_files:
+                file_match = all(sub in canonical_lower for sub in inline_files)
+                if not file_match:
+                    continue
+
+            full_path = os.path.join(root, f)
+            with open(full_path, "r", encoding="utf-8") as file:
+                content = file.read()
+
+            tags, _ = extract_metadata(content)
+            tags_lower = [t.lower() for t in tags]
+
+            if inline_tags:
+                tag_match = all(t in tags_lower for t in inline_tags)
+                if not tag_match:
+                    continue
+
+            content_lower = content.lower()
+            if free_text_query:
+                name_has_text = free_text_query in canonical_lower
+                idx = content_lower.find(free_text_query)
+
+                if name_has_text or idx != -1:
+                    start = max(0, idx - 45)
+                    end = min(len(content), idx + len(free_text_query) + 45)
+                    raw_snippet = content[start:end].replace("\n", " ").strip()
+                    snippet = f"...{raw_snippet}..." if idx != -1 else "Match found in note name."
+
+                    matches.append({
+                        "path": rel_file,
+                        "canonical_name": canonical,
+                        "snippet": snippet,
+                        "tags": tags
+                    })
+            else:
+                first_line = content.splitlines()[0] if content.splitlines() else "Empty note"
+                matches.append({
+                    "path": rel_file,
+                    "canonical_name": canonical,
+                    "snippet": first_line[:90],
+                    "tags": tags
+                })
+
+    return jsonify(matches)
+
+@app.route("/api/search-suggestions", methods=["GET"])
+def get_search_suggestions():
+    folder_counter = Counter()
+    tag_counter = Counter()
+    files = set()
+
+    for root, dirs, filenames in os.walk(VAULT_DIR):
+        for d in dirs:
+            rel_dir = clean_canonical_name(os.path.relpath(os.path.join(root, d), VAULT_DIR))
+            if rel_dir:
+                folder_counter[rel_dir] += 0
+
+        for f in filenames:
+            if not f.endswith(".md"):
+                continue
+
+            rel_file = os.path.relpath(os.path.join(root, f), VAULT_DIR).replace("\\", "/")
+            canonical = clean_canonical_name(rel_file)
+            files.add(canonical)
+
+            folder_dir = os.path.dirname(canonical)
+            if folder_dir:
+                parts = folder_dir.split("/")
+                for i in range(1, len(parts) + 1):
+                    ancestor = "/".join(parts[:i])
+                    folder_counter[ancestor] += 1
+
+            full_path = os.path.join(root, f)
+            with open(full_path, "r", encoding="utf-8") as file:
+                content = file.read()
+            note_tags, _ = extract_metadata(content)
+            for t in note_tags:
+                tag_counter[t] += 1
+
+    return jsonify({
+        "folders": [{"name": k, "count": v} for k, v in sorted(folder_counter.items(), key=lambda x: x[0].lower())],
+        "tags": [{"name": k, "count": v} for k, v in sorted(tag_counter.items(), key=lambda x: x[0].lower())],
+        "files": sorted(list(files), key=lambda s: s.lower())
+    })
+
+@app.route("/api/graph", methods=["GET"])
+def get_graph():
+    nodes = []
+    links = []
+    node_set = set()
+
+    for root, _, files in os.walk(VAULT_DIR):
+        for f in files:
+            if f.endswith(".md"):
+                rel_file = os.path.relpath(os.path.join(root, f), VAULT_DIR).replace("\\", "/")
+                canonical = clean_canonical_name(rel_file)
+                node_set.add(canonical)
+
+                with open(os.path.join(root, f), "r", encoding="utf-8") as file:
+                    content = file.read()
+                tags, wikilinks = extract_metadata(content)
+                nodes.append({
+                    "id": canonical,
+                    "title": canonical,
+                    "tags": tags,
+                    "wikilinks": wikilinks
+                })
+
+    for node in nodes:
+        for target in node["wikilinks"]:
+            if target in node_set and target != node["id"]:
+                links.append({
+                    "source": node["id"],
+                    "target": target,
+                    "type": "wikilink"
+                })
+
+    return jsonify({"nodes": nodes, "links": links})
 
 if __name__ == "__main__":
-    init_db()
-    sync_cache()
-    app.run(host="127.0.0.1", port=5050, debug=True)
+    app.run(debug=True, port=5000)
