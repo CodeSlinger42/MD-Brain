@@ -423,6 +423,38 @@
       white-space: nowrap;
     }
 
+    /* External Update Notification Banner */
+    #external-alert-banner {
+      display: none;
+      background: #7c2d12;
+      border-bottom: 1px solid #ea580c;
+      color: #ffedd5;
+      padding: 6px 14px;
+      font-size: 0.78rem;
+      align-items: center;
+      justify-content: space-between;
+      z-index: 1600;
+    }
+    #external-alert-banner.active {
+      display: flex;
+    }
+    .banner-btn-group {
+      display: flex;
+      gap: 6px;
+    }
+    .banner-btn {
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      color: #ffffff;
+      padding: 2px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 0.72rem;
+    }
+    .banner-btn:hover {
+      background: rgba(0, 0, 0, 0.6);
+    }
+
     #mobile-view-tabs {
       display: none;
       background: var(--bg-secondary);
@@ -769,6 +801,14 @@
       </div>
     </div>
 
+    <div id="external-alert-banner">
+      <span>⚠️ File modified externally. Reload to view changes?</span>
+      <div class="banner-btn-group">
+        <button class="banner-btn" onclick="acceptExternalFileUpdate()">Reload File</button>
+        <button class="banner-btn" onclick="dismissExternalFileUpdate()">Keep My Version</button>
+      </div>
+    </div>
+
     <div id="mobile-view-tabs">
       <button class="view-tab-btn active" id="tab-edit" onclick="setMobileView('edit')">✏️ Edit</button>
       <button class="view-tab-btn" id="tab-preview" onclick="setMobileView('preview')">👁 Preview</button>
@@ -836,6 +876,12 @@
 
     let graphEdgesSelection = null;
     let graphSimulation = null;
+
+    // External sync and conflict state
+    let currentTreeHash = "";
+    let activeFileMtime = null;
+    let pendingExternalContent = null;
+    let isDirty = false;
 
     const fileTree = document.getElementById("file-tree");
     const searchResults = document.getElementById("search-results");
@@ -965,6 +1011,7 @@
       if (res.ok) {
         if (currentCanonical === canonicalName || (isFolder && currentCanonical && currentCanonical.startsWith(canonicalName + "/"))) {
           currentCanonical = null;
+          activeFileMtime = null;
           noteNameInput.value = "";
           markdownInput.value = "";
           previewPane.innerHTML = "";
@@ -972,6 +1019,7 @@
           document.getElementById("backlinks-list").innerHTML = "";
           document.getElementById("related-list").innerHTML = "";
           document.getElementById("save-status").textContent = "Deleted";
+          dismissExternalFileUpdate();
         }
         await loadTree();
         loadSearchSuggestions();
@@ -987,13 +1035,16 @@
 
     async function openNote(canonicalName) {
       closeAllDrawers();
+      dismissExternalFileUpdate();
       const res = await fetch(`/api/note?path=${encodeURIComponent(canonicalName)}`);
       if (!res.ok) return;
 
       const data = await res.json();
       currentCanonical = data.canonical_name;
+      activeFileMtime = data.mtime;
       noteNameInput.value = currentCanonical;
       markdownInput.value = data.content;
+      isDirty = false;
 
       renderTags(data.tags);
       updatePreview(data.content);
@@ -1046,6 +1097,7 @@
       if (res.ok) {
         const data = await res.json();
         currentCanonical = data.new_canonical_name;
+        if (data.mtime) activeFileMtime = data.mtime;
         noteNameInput.value = currentCanonical;
         document.getElementById("save-status").textContent = data.refactored_notes_count > 0 
           ? `Saved (${data.refactored_notes_count} links updated)` 
@@ -1134,11 +1186,7 @@
 
       clearTimeout(saveTimer);
       saveTimer = setTimeout(async () => {
-        await fetch("/api/save", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path: currentCanonical, content: markdownInput.value })
-        });
+        triggerServerSave(markdownInput.value);
       }, 300);
     }
 
@@ -1180,7 +1228,29 @@
       }
     });
 
+    async function triggerServerSave(content) {
+      document.getElementById("save-status").textContent = "Saving...";
+      const res = await fetch("/api/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: currentCanonical, content })
+      });
+      const data = await res.json();
+      document.getElementById("save-status").textContent = "Saved";
+      isDirty = false;
+
+      if (data.canonical_name && data.canonical_name !== currentCanonical) {
+        currentCanonical = data.canonical_name;
+        noteNameInput.value = currentCanonical;
+        loadTree();
+      }
+      if (data.mtime) {
+        activeFileMtime = data.mtime;
+      }
+    }
+
     markdownInput.addEventListener("input", (e) => {
+      isDirty = true;
       const content = e.target.value;
       updatePreview(content);
 
@@ -1190,20 +1260,7 @@
       document.getElementById("save-status").textContent = "Typing...";
       clearTimeout(saveTimer);
       saveTimer = setTimeout(async () => {
-        document.getElementById("save-status").textContent = "Saving...";
-        const res = await fetch("/api/save", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path: currentCanonical, content })
-        });
-        const data = await res.json();
-        document.getElementById("save-status").textContent = "Saved";
-
-        if (data.canonical_name && data.canonical_name !== currentCanonical) {
-          currentCanonical = data.canonical_name;
-          noteNameInput.value = currentCanonical;
-          loadTree();
-        }
+        triggerServerSave(content);
       }, 500);
     });
 
@@ -1500,7 +1557,7 @@
       triggerSearch();
     }
 
-    // Header Path Tab-Completion
+    // Title Bar Path Tab-Completion
     let tabCompletionState = {
       active: false,
       candidates: [],
@@ -1694,6 +1751,84 @@
         hideTitleTabMenu();
       }
     });
+
+    // Conflict & External Sync Handling
+    function acceptExternalFileUpdate() {
+      if (pendingExternalContent !== null) {
+        markdownInput.value = pendingExternalContent;
+        updatePreview(pendingExternalContent);
+        isDirty = false;
+        document.getElementById("save-status").textContent = "Reloaded";
+      }
+      dismissExternalFileUpdate();
+    }
+
+    function dismissExternalFileUpdate() {
+      pendingExternalContent = null;
+      document.getElementById("external-alert-banner").classList.remove("active");
+    }
+
+    async function checkSyncStatus() {
+      if (document.hidden) return;
+
+      try {
+        const params = new URLSearchParams({
+          tree_hash: currentTreeHash,
+          active_path: currentCanonical || "",
+          client_mtime: activeFileMtime !== null ? activeFileMtime : ""
+        });
+
+        const res = await fetch(`/api/sync/status?${params.toString()}`);
+        if (!res.ok) return;
+        const data = await res.json();
+
+        // 1. Vault structure changed externally
+        if (data.tree_changed) {
+          currentTreeHash = data.tree_hash;
+          await loadTree();
+          loadSearchSuggestions();
+          if (currentCanonical) {
+            loadBacklinks(currentCanonical);
+            loadRelated(currentCanonical);
+          }
+        }
+
+        // 2. Active file modified externally
+        if (data.file_modified && data.content !== null) {
+          activeFileMtime = data.server_mtime;
+          if (!isDirty) {
+            markdownInput.value = data.content;
+            updatePreview(data.content);
+            document.getElementById("save-status").textContent = "Synced";
+            setTimeout(() => { document.getElementById("save-status").textContent = "Ready"; }, 1500);
+          } else {
+            pendingExternalContent = data.content;
+            document.getElementById("external-alert-banner").classList.add("active");
+          }
+        }
+      } catch (err) {}
+    }
+
+    async function runPeriodicSweep() {
+      if (document.hidden) return;
+      try {
+        const res = await fetch("/api/sync/sweep", { method: "POST" });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.updated > 0 || data.purged > 0) {
+            loadSearchSuggestions();
+            if (currentCanonical) {
+              loadRelated(currentCanonical);
+              loadBacklinks(currentCanonical);
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
+    setInterval(checkSyncStatus, 4000);
+    setInterval(runPeriodicSweep, 30000);
+    checkSyncStatus();
 
     // D3 Graph View & Semantic Association
     function toggleGraphView() {
