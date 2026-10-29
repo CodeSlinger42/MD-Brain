@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import sqlite3
+import hashlib
 from datetime import datetime
 from collections import Counter
 import numpy as np
@@ -58,7 +59,6 @@ def extract_first_heading(content):
     return clean_canonical_name(raw_title)[:100]
 
 def get_or_update_embedding(rel_path, content):
-    import hashlib
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
     tags, _ = extract_metadata(content)
     tags_str = ",".join(tags)
@@ -141,6 +141,23 @@ def refactor_wikilinks_vault(old_prefix, new_prefix, is_folder=False):
 
     return updated_count
 
+def compute_tree_fingerprint():
+    """Generates a fast fingerprint representing vault structure and file mtimes."""
+    entries = []
+    for root, _, files in os.walk(VAULT_DIR):
+        for f in files:
+            if not f.endswith(".md"):
+                continue
+            full_path = os.path.join(root, f)
+            try:
+                stat = os.stat(full_path)
+                rel_path = os.path.relpath(full_path, VAULT_DIR).replace("\\", "/")
+                entries.append(f"{rel_path}:{stat.st_mtime_ns}")
+            except OSError:
+                continue
+    entries.sort()
+    return hashlib.sha1(";".join(entries).encode("utf-8")).hexdigest()
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -182,13 +199,15 @@ def get_note():
     with open(full_path, "r", encoding="utf-8") as f:
         content = f.read()
 
+    mtime = os.path.getmtime(full_path)
     tags, links = extract_metadata(content)
     return jsonify({
         "path": rel_file,
         "canonical_name": canonical,
         "content": content,
         "tags": tags,
-        "links": links
+        "links": links,
+        "mtime": mtime
     })
 
 @app.route("/api/save", methods=["POST"])
@@ -237,9 +256,11 @@ def save_note():
                     refactor_wikilinks_vault(canonical, target_canonical, is_folder=False)
                     canonical = target_canonical
                     rel_file = target_file
+                    full_path = target_full
 
     get_or_update_embedding(rel_file, content)
-    return jsonify({"status": "saved", "path": rel_file, "canonical_name": canonical})
+    mtime = os.path.getmtime(full_path)
+    return jsonify({"status": "saved", "path": rel_file, "canonical_name": canonical, "mtime": mtime})
 
 @app.route("/api/rename", methods=["POST"])
 def rename_note():
@@ -305,11 +326,14 @@ def rename_note():
     # Automatically update all WikiLinks in existing notes
     refactored_count = refactor_wikilinks_vault(old_canonical, new_canonical, is_folder=is_folder)
 
+    new_mtime = os.path.getmtime(new_full) if not is_folder and os.path.exists(new_full) else None
+
     return jsonify({
         "status": "renamed",
         "new_path": f"{new_canonical}.md" if not is_folder else new_canonical,
         "new_canonical_name": new_canonical,
-        "refactored_notes_count": refactored_count
+        "refactored_notes_count": refactored_count,
+        "mtime": new_mtime
     })
 
 @app.route("/api/delete", methods=["POST"])
@@ -361,7 +385,8 @@ def daily_note():
             f.write(initial_content)
         get_or_update_embedding(rel_file, initial_content)
 
-    return jsonify({"path": rel_file, "canonical_name": canonical})
+    mtime = os.path.getmtime(full_path)
+    return jsonify({"path": rel_file, "canonical_name": canonical, "mtime": mtime})
 
 @app.route("/api/resolve-link", methods=["GET"])
 def resolve_link():
@@ -687,6 +712,98 @@ def get_graph():
                     })
 
     return jsonify({"nodes": nodes, "links": links})
+
+@app.route("/api/sync/status", methods=["GET"])
+def sync_status():
+    """
+    Lightweight check (<5ms) for:
+      1. Tree structural changes across the vault.
+      2. External edits to the currently active note.
+    """
+    client_tree_hash = request.args.get("tree_hash", "")
+    current_canonical = clean_canonical_name(request.args.get("active_path", ""))
+    client_mtime = request.args.get("client_mtime", type=float)
+
+    server_tree_hash = compute_tree_fingerprint()
+    tree_changed = (client_tree_hash != server_tree_hash)
+
+    file_modified = False
+    current_content = None
+    server_mtime = None
+
+    if current_canonical:
+        full_path = os.path.normpath(os.path.join(VAULT_DIR, f"{current_canonical}.md"))
+        if os.path.isfile(full_path):
+            try:
+                server_mtime = os.path.getmtime(full_path)
+                if client_mtime is not None and (server_mtime - client_mtime) > 0.25:
+                    file_modified = True
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        current_content = f.read()
+            except OSError:
+                pass
+
+    return jsonify({
+        "tree_changed": tree_changed,
+        "tree_hash": server_tree_hash,
+        "file_modified": file_modified,
+        "server_mtime": server_mtime,
+        "content": current_content
+    })
+
+@app.route("/api/sync/sweep", methods=["POST"])
+def sync_sweep():
+    """
+    Incremental reconciliation sweep:
+      1. Generates missing or stale embeddings/metadata.
+      2. Removes orphaned database entries for externally deleted files.
+    """
+    updated_notes = 0
+    purged_notes = 0
+    existing_rel_paths = set()
+
+    for root, _, files in os.walk(VAULT_DIR):
+        for f in files:
+            if not f.endswith(".md"):
+                continue
+
+            full_path = os.path.join(root, f)
+            rel_file = os.path.relpath(full_path, VAULT_DIR).replace("\\", "/")
+            existing_rel_paths.add(rel_file)
+
+            try:
+                with open(full_path, "r", encoding="utf-8") as file:
+                    content = file.read()
+            except OSError:
+                continue
+
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT content_hash FROM file_embeddings WHERE rel_path = ?", (rel_file,))
+                row = cursor.fetchone()
+
+                if not row or row[0] != content_hash:
+                    get_or_update_embedding(rel_file, content)
+                    updated_notes += 1
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT rel_path FROM file_embeddings")
+        db_records = [r[0] for r in cursor.fetchall()]
+
+        for db_rel in db_records:
+            if db_rel not in existing_rel_paths:
+                conn.execute("DELETE FROM file_embeddings WHERE rel_path = ?", (db_rel,))
+                purged_notes += 1
+        conn.commit()
+
+    return jsonify({
+        "status": "completed",
+        "updated": updated_notes,
+        "purged": purged_notes
+    })
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
