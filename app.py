@@ -14,7 +14,7 @@ DB_PATH = "vault_metadata.db"
 
 os.makedirs(VAULT_DIR, exist_ok=True)
 
-# Local embedding model (~100MB footprint)
+# Local ONNX-based embedding model (~100MB footprint)
 model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 def init_db():
@@ -654,6 +654,37 @@ def get_graph():
                     "target": target,
                     "type": "wikilink"
                 })
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT rel_path, embedding FROM file_embeddings")
+        rows = cursor.fetchall()
+
+    embeddings = {}
+    for rel_p, raw_blob in rows:
+        canon = clean_canonical_name(rel_p)
+        if canon in node_set and raw_blob:
+            embeddings[canon] = np.frombuffer(raw_blob, dtype=np.float32)
+
+    canon_keys = list(embeddings.keys())
+    for i in range(len(canon_keys)):
+        for j in range(i + 1, len(canon_keys)):
+            c1, c2 = canon_keys[i], canon_keys[j]
+            e1, e2 = embeddings[c1], embeddings[c2]
+            sim = float(np.dot(e1, e2) / (np.linalg.norm(e1) * np.linalg.norm(e2) + 1e-9))
+
+            if sim >= 0.50:
+                is_explicitly_linked = any(
+                    (l["source"] == c1 and l["target"] == c2) or (l["source"] == c2 and l["target"] == c1)
+                    for l in links if l["type"] == "wikilink"
+                )
+                if not is_explicitly_linked:
+                    links.append({
+                        "source": c1,
+                        "target": c2,
+                        "type": "semantic",
+                        "similarity": round(sim, 2)
+                    })
 
     return jsonify({"nodes": nodes, "links": links})
 
